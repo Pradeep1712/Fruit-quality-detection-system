@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fruit Quality Scanner</title>
+    <style>
+        body { font-family: Arial, sans-serif; text-align: center; padding: 30px; background-color: #2c3e50; color: white; }
+        .container { background: #34495e; padding: 25px; border-radius: 12px; display: inline-block; box-shadow: 0 4px 15px rgba(0,0,0,0.3); }
+        video { width: 100%; max-width: 450px; border-radius: 8px; border: 3px solid #1abc9c; background: #000; }
+        button { background-color: #1abc9c; color: white; border: none; padding: 12px 24px; margin-top: 15px; cursor: pointer; border-radius: 6px; font-size: 16px; font-weight: bold; }
+        button:hover { background-color: #16a085; }
+        button:disabled { background-color: #7f8c8d; cursor: not-allowed; }
+        #status { font-weight: bold; margin-top: 15px; color: #f1c40f; }
+        #results { margin-top: 20px; text-align: left; background: #ecf0f1; color: #2c3e50; padding: 20px; border-radius: 8px; display: none; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>Real-Time Fruit Quality & Nutrition</h2>
+    <video id="webcam" autoplay playsinline></video>
+    <br>
+    <button id="scanBtn" onclick="startScan()">Start 10-Frame Scan</button>
+    <p id="status">Status: Waiting to scan...</p>
+    
+    <div id="results">
+        <h3 id="finalFruit"></h3>
+        <p><strong>Nutrition Info:</strong> <span id="nutritionData">Loading GPT-4o data...</span></p>
+    </div>
+</div>
+
+<script>
+    const video = document.getElementById('webcam');
+    const scanBtn = document.getElementById('scanBtn');
+    const statusText = document.getElementById('status');
+    const resultsDiv = document.getElementById('results');
+    const finalFruitText = document.getElementById('finalFruit');
+    const nutritionDataText = document.getElementById('nutritionData');
+    
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    
+    let frameCount = 0;
+    const MAX_FRAMES = 10;
+    
+    const FRUIT_CLASSES = ['Apple', 'Banana', 'Orange']; 
+    const FRESHNESS_CLASSES = ['Fresh', 'Rotten'];       
+
+    let accumulatedTypeProbs = new Array(FRUIT_CLASSES.length).fill(0);
+    let accumulatedFreshProbs = new Array(FRESHNESS_CLASSES.length).fill(0);
+
+    // Initialize Webcam
+    navigator.mediaDevices.getUserMedia({ video: true })
+        .then(stream => { video.srcObject = stream; })
+        .catch(err => { statusText.innerText = "Error accessing webcam. Please allow permissions."; });
+
+    function startScan() {
+        // Reset Variables
+        frameCount = 0;
+        accumulatedTypeProbs.fill(0);
+        accumulatedFreshProbs.fill(0);
+        
+        scanBtn.disabled = true;
+        resultsDiv.style.display = 'none';
+        statusText.innerText = "Status: Scanning... Please rotate the fruit.";
+        
+        captureFrame();
+    }
+
+    function captureFrame() {
+        if (frameCount >= MAX_FRAMES) {
+            finalizeScan();
+            return;
+        }
+        
+        // Draw current video frame to canvas
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        
+        // Convert canvas to JPG Blob
+        canvas.toBlob(blob => {
+            const formData = new FormData();
+            formData.append('image', blob, `frame_${frameCount}.jpg`);
+            
+            // Send blob to Flask backend
+            fetch('/upload_blob', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.error) {
+                    console.error("Backend Error:", data.error);
+                    return;
+                }
+                
+                // Add the probabilities to our running total
+                for (let i = 0; i < data.type_probs.length; i++) {
+                    accumulatedTypeProbs[i] += data.type_probs[i];
+                }
+                for (let i = 0; i < data.fresh_probs.length; i++) {
+                    accumulatedFreshProbs[i] += data.fresh_probs[i];
+                }
+                
+                frameCount++;
+                statusText.innerText = `Status: Captured ${frameCount}/${MAX_FRAMES} frames...`;
+                
+                // Wait 500ms before capturing the next frame to allow for fruit rotation
+                setTimeout(captureFrame, 500); 
+            })
+            .catch(err => console.error("Fetch Error:", err));
+        }, 'image/jpeg');
+    }
+
+    function finalizeScan() {
+        statusText.innerText = "Status: Scan complete. Averaging results & fetching nutrition...";
+        
+        // Calculate the mathematical average of the arrays
+        let avgTypeProbs = accumulatedTypeProbs.map(val => val / MAX_FRAMES);
+        let avgFreshProbs = accumulatedFreshProbs.map(val => val / MAX_FRAMES);
+        
+        // Find the index with the highest average probability
+        let bestTypeIdx = avgTypeProbs.indexOf(Math.max(...avgTypeProbs));
+        let bestFreshIdx = avgFreshProbs.indexOf(Math.max(...avgFreshProbs));
+        
+        let detectedType = FRUIT_CLASSES[bestTypeIdx];
+        let detectedFreshness = FRESHNESS_CLASSES[bestFreshIdx];
+        let finalName = `${detectedFreshness} ${detectedType}`;
+        
+        // Update UI
+        finalFruitText.innerText = `Result: ${finalName}`;
+        nutritionDataText.innerText = "Loading GPT-4o data...";
+        resultsDiv.style.display = 'block';
+        
+        // Ping the second Flask endpoint to get the OpenAI data
+        fetch('/get_nutrition', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ fruit_name: finalName })
+        })
+        .then(res => res.json())
+        .then(data => {
+            if(data.nutrition) {
+                nutritionDataText.innerText = data.nutrition;
+            } else {
+                nutritionDataText.innerText = "Error fetching nutrition data.";
+            }
+            scanBtn.disabled = false;
+            statusText.innerText = "Status: Ready for next scan.";
+        })
+        .catch(err => {
+            nutritionDataText.innerText = "Network error fetching nutrition.";
+            scanBtn.disabled = false;
+        });
+    }
+</script>
+</body>
+</html>
